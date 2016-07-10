@@ -1,7 +1,4 @@
 
-// Reference:
-// https://github.com/embmicro/mojo-loader/blob/basic-loader/src/com/embeddedmicro/mojo/MojoLoader.java
-
 #include <stdio.h>
 #include <unistd.h>
 #include <string.h>
@@ -9,19 +6,13 @@
 #include <getopt.h>
 #include <stdlib.h>
 
-
 #include <sys/ioctl.h>
 #include <errno.h>
 #include <fcntl.h>
 #include <termios.h>
 
-
-// This has been copied from the serial initialization from the mojo java
-// uploader
-// #define BAUDRATE B115200
-// #define DATABITS 8
-// #define STOPBITS 1
-// #define PARITY 0 // None
+#define FILE_SIZE_LIMIT   (1UL << 32)
+#define BLOCK_SIZE 2048
 
 static int usage(const char *progname) {
   fprintf(stderr, "usage: %s [options] binary\n", progname);
@@ -33,20 +24,18 @@ static int usage(const char *progname) {
   return 1;
 }
 
-// Inspired by:
-// http://stackoverflow.com/questions/6947413/how-to-open-read-and-write-from-serial-port-in-c
-// flags: https://en.wikibooks.org/wiki/Serial_Programming/termios
 int serial_setup(int fd) {
   struct termios config;
   bzero(&config, sizeof(config));
 
   if (tcgetattr(fd, &config) != 0) {
     fprintf(stderr, "Error %d from tcgetattr.\n", errno);
-    return 1;
+    return -1;
   }
 
-  if(cfsetispeed(&config,  B115200) < 0 || cfsetospeed(&config,  B115200) < 0) {
+  if (cfsetispeed(&config,  B115200) < 0 || cfsetospeed(&config,  B115200) < 0) {
     fprintf(stderr, "Error while setting baudrate");
+    return -1;
   }
 
   config.c_iflag &= ~(IGNBRK | BRKINT | ICRNL | INLCR | PARMRK | INPCK |
@@ -55,8 +44,7 @@ int serial_setup(int fd) {
   config.c_cflag &= ~(CSIZE | PARENB);
   config.c_cflag |= CS8;
 
-  if (tcsetattr(fd, TCSAFLUSH, &config) != 0)
-  {
+  if (tcsetattr(fd, TCSAFLUSH, &config) != 0) {
     fprintf(stderr, "Error %d from tcsetattr.\n", errno);
     return -1;
   }
@@ -67,6 +55,7 @@ int serial_setup(int fd) {
 void reset_mojo(int fd) {
   int flag, i;
   flag = TIOCM_DTR;
+
   ioctl(fd, TIOCMBIS, &flag); // DTR on
   usleep(1e3);
   for (i = 0; i < 5; ++i) {
@@ -74,45 +63,53 @@ void reset_mojo(int fd) {
     usleep(1e3);
     ioctl(fd, TIOCMBIS, &flag);// DTR on
   }
+
+  // Clear the buffer
+  tcflush(fd, TCIOFLUSH);
 }
 
+void upload_binary(int fd_serial, int fd_bin, const uint32_t bin_size) {
+  int transferred, block;
+  float perc;
+  char recv, send;
+  char buf[BLOCK_SIZE];
 
-void upload_binary(int fd, const char *filename, char flash, char verify) {
-  char recv;
-  int status;
-  FILE *fbin = fopen(filename, "rb");
-  fseek(fbin, 0L, SEEK_END);
-  const long fsize = ftell(fbin);
-  rewind(fbin);
-
-  //Let's load the whole file in memory
-  char *bin = malloc(sizeof(char) * fsize);
-  if (fread(bin, 1, fsize, fbin) != fsize) {
-    fprintf(stderr, "Error wile uploading file on memory");
-  }
-  fclose(fbin);
-
-  char send = 'R';
-  write(fd, &send, sizeof(char));
-  status = read(fd, &recv, sizeof(char));
-  if (status == 0 ||  recv != 'R') {
-    fprintf(stderr, "Mojo not answering correctly:\n"
-                    "expecting: 'R', received: %d bytes: '%c')."
-                    "Exiting...\n", status, recv);
+  send = 'R';
+  write(fd_serial, &send, sizeof(char));
+  if (read(fd_serial, &recv, sizeof(char)) == 0 || recv != 'R') {
+    fprintf(stderr, "Mojo did not respond! Make sure the port is correct.\n"
+                    "Exiting...\n");
     exit(1);
   }
 
-  const uint32_t buf = fsize;
-  write(fd, &buf, sizeof(uint32_t));
-  status = read(fd, &recv, sizeof(char));
-  if (status == 0 ||  recv != 'O') {
-    fprintf(stderr, "Mojo not answering correctly:\n"
-                    "expecting: '0', received: %d bytes: '%c')."
-                    "Exiting...\n", status, recv);
+  write(fd_serial, &bin_size, sizeof(uint32_t));
+  if (read(fd_serial, &recv, sizeof(char)) == 0 || recv != 'O') {
+    fprintf(stderr, "Mojo did not aknowledged the file size.\n"
+                    "Exiting...\n");
     exit(1);
   }
 
-  free(bin);
+  setbuf(stdout, NULL);
+
+  // Split in chunks, let's avoid to upload the whole file in RAM.
+  transferred = 0;
+  printf("%.2f%%\n", 0.0);
+  while(transferred != bin_size) {
+    block = read(fd_bin, buf, BLOCK_SIZE);
+    if (block == write(fd_serial, buf, block)) transferred += block;
+    else {
+      fprintf(stderr, "Error during writing...");
+      exit(1);
+    }
+    perc = (float) transferred / bin_size;
+    printf("%.2f%%\n", perc * 100);
+  }
+
+  if (read(fd_serial, &recv, sizeof(char)) == 0 || recv != 'D') {
+    fprintf(stderr, "Mojo did not aknowledged the transfer.\n"
+                    "Exiting...\n");
+    exit(1);
+  }
 }
 
 int main(int argc, char *argv[]) {
@@ -161,32 +158,39 @@ int main(int argc, char *argv[]) {
     return usage(argv[0]);
   }
 
-  filename = argv[optind];
+  filename = strdup(argv[optind]);
 
-  printf("filename:    %s\n"
-         "serial_port: %s\n"
-         "verify:      %s\n"
-         "flash:       %s\n",
-          filename, interface, verify ? "True" : "False", flash ?
-          "True" : "False");
+  // Open the mojo interface
+  int fd_serial = open(interface, O_RDWR | O_NOCTTY | O_SYNC);
 
-  // Open the interface
-  int fd = open(interface, O_RDWR | O_NOCTTY | O_SYNC);
-
-  if (fd < 0) {
-    return fprintf(stderr, "Error opening the device.\n");
+  if (fd_serial < 0) {
+    return fprintf(stderr, "Error while opening the device.\n");
   }
 
-  if (serial_setup(fd) != 0) {
-    fprintf(stderr, "Error while serial initialization");
+  if (serial_setup(fd_serial) < 0) {
+    fprintf(stderr, "Error during serial initialization\n");
     exit(1);
   }
 
-  reset_mojo(fd);
-  tcflush(fd, TCIOFLUSH);
+  reset_mojo(fd_serial);
 
-  upload_binary(fd, filename, 0, 0);
+  // Open file
+  int fd_bin = open(filename, O_RDONLY | O_RSYNC);
 
-  close(fd);
+  // Get file size
+  const long bin_size = lseek(fd_bin, 0L, SEEK_END);
+  // Rewind
+  lseek(fd_bin, 0L, SEEK_SET);
+
+  if (bin_size >  FILE_SIZE_LIMIT) {
+    fprintf(stderr, "Error the selected file is too big\n");
+    exit(1);
+  }
+
+  upload_binary(fd_serial, fd_bin, bin_size);
+
+  //tcflush(fd_serial, TCIOFLUSH);
+  close(fd_bin);
+  close(fd_serial);
   return 0;
 }

@@ -9,4 +9,4 @@ clean:
 loader: mojo-loader
 
 % : %.c
-	$(CC) -Wall $^ -o $@
+	$(CC) -Wall -g $^ -o $@
