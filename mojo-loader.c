@@ -11,8 +11,15 @@
 #include <fcntl.h>
 #include <termios.h>
 
+#include <sys/types.h>
+#include <sys/select.h>
+
+#include <unistd.h>
+
+#include <stdbool.h>
+
 #define FILE_SIZE_LIMIT   (1UL << 32)
-#define BLOCK_SIZE 2048
+#define BLOCK_SIZE 1024
 
 static int usage(const char *progname) {
   fprintf(stderr, "usage: %s [options] binary\n", progname);
@@ -39,10 +46,14 @@ int serial_setup(int fd) {
   }
 
   config.c_iflag &= ~(IGNBRK | BRKINT | ICRNL | INLCR | PARMRK | INPCK |
-                      ISTRIP | IXON);
-  config.c_lflag &= ~(ECHO | ECHONL | ICANON | IEXTEN | ISIG);
+                      ISTRIP | IXON | IXOFF | IXANY);
+  config.c_lflag = 0;
   config.c_cflag &= ~(CSIZE | PARENB);
   config.c_cflag |= CS8;
+  config.c_cflag |= (CLOCAL | CREAD);
+  config.c_cflag &= ~CRTSCTS;
+  config.c_cc[VMIN]  = 1;
+  config.c_cc[VTIME] = 5;
 
   if (tcsetattr(fd, TCSAFLUSH, &config) != 0) {
     fprintf(stderr, "Error %d from tcsetattr.\n", errno);
@@ -57,15 +68,12 @@ void reset_mojo(int fd) {
   flag = TIOCM_DTR;
 
   ioctl(fd, TIOCMBIS, &flag); // DTR on
-  usleep(1e3);
+  usleep(5e3);
   for (i = 0; i < 5; ++i) {
     ioctl(fd, TIOCMBIC, &flag);// DTR off
-    usleep(1e3);
+    usleep(5e3);
     ioctl(fd, TIOCMBIS, &flag);// DTR on
   }
-
-  // Clear the buffer
-  tcflush(fd, TCIOFLUSH);
 }
 
 void upload_binary(int fd_serial, int fd_bin, const uint32_t bin_size) {
@@ -74,6 +82,7 @@ void upload_binary(int fd_serial, int fd_bin, const uint32_t bin_size) {
   char recv, send;
   char buf[BLOCK_SIZE];
 
+  tcflush(fd_serial, TCIOFLUSH);
   send = 'R';
   write(fd_serial, &send, sizeof(char));
   if (read(fd_serial, &recv, sizeof(char)) == 0 || recv != 'R') {
@@ -89,12 +98,10 @@ void upload_binary(int fd_serial, int fd_bin, const uint32_t bin_size) {
     exit(1);
   }
 
-  setbuf(stdout, NULL);
-
-  // Split in chunks, let's avoid to upload the whole file in RAM.
+  //Split in chunks, let's avoid to upload the whole file in RAM.
   transferred = 0;
-  printf("%.2f%%\n", 0.0);
-  while(transferred != bin_size) {
+  printf("%.0f%%\n", 0.0);
+  while (transferred != bin_size) {
     block = read(fd_bin, buf, BLOCK_SIZE);
     if (block == write(fd_serial, buf, block)) transferred += block;
     else {
@@ -102,7 +109,7 @@ void upload_binary(int fd_serial, int fd_bin, const uint32_t bin_size) {
       exit(1);
     }
     perc = (float) transferred / bin_size;
-    printf("%.2f%%\n", perc * 100);
+    printf("%.1f%%\n", perc * 100);
   }
 
   if (read(fd_serial, &recv, sizeof(char)) == 0 || recv != 'D') {
@@ -176,6 +183,8 @@ int main(int argc, char *argv[]) {
 
   // Open file
   int fd_bin = open(filename, O_RDONLY | O_RSYNC);
+  if (fd_bin < 0)
+    fprintf(stderr, "Error while opening the binary file %d", errno);
 
   // Get file size
   const long bin_size = lseek(fd_bin, 0L, SEEK_END);
@@ -189,8 +198,9 @@ int main(int argc, char *argv[]) {
 
   upload_binary(fd_serial, fd_bin, bin_size);
 
-  //tcflush(fd_serial, TCIOFLUSH);
-  close(fd_bin);
-  close(fd_serial);
+  if (close(fd_bin) < 0)
+    fprintf(stderr, "Error on closing the binary file: %d", errno);
+  if (close(fd_serial) < 0)
+    fprintf(stderr, "Error on closing the serial port: %d", errno);
   return 0;
 }
